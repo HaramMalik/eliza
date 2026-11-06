@@ -1,0 +1,205 @@
+/** Runs the real cancellation service and repository on PGlite with only Stripe faked: a refused or lost cancel must settle instead of blocking the organization for good. */
+import { afterAll, beforeAll, expect, mock, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import {
+  installCancellationTestSchema,
+  seedCancellationTestAccount,
+} from "../../db/repositories/subscription-cancellation-test-fixture";
+
+process.env.DATABASE_URL = "pglite://memory";
+process.env.TEST_DATABASE_URL = "pglite://memory";
+process.env.ENVIRONMENT = "local";
+process.env.STRIPE_SECRET_KEY = "sk_test_cancelsettle";
+process.env.STRIPE_PLUS_MONTHLY_PRICE_ID = "price_plus";
+process.env.STRIPE_PLUS_PRODUCT_ID = "prod_plus";
+process.env.STRIPE_PRO_MONTHLY_PRICE_ID = "price_pro";
+process.env.STRIPE_PRO_PRODUCT_ID = "prod_pro";
+
+let customer: unknown;
+let subscription: unknown;
+let updateImpl = async (): Promise<unknown> => {
+  throw new Error("No provider update is expected");
+};
+const update = mock(async (..._args: unknown[]) => updateImpl());
+mock.module("../stripe", () => ({
+  requireStripe: () => ({
+    customers: { retrieve: async () => customer },
+    subscriptions: { retrieve: async () => subscription, update },
+  }),
+}));
+let client: typeof import("../../db/client");
+let repo: typeof import("../../db/repositories/subscription-cancellation");
+let service: typeof import("./subscription-cancellation");
+beforeAll(async () => {
+  client = await import("../../db/client");
+  await installCancellationTestSchema((q) => client.getPgliteClientForTests().exec(q));
+  repo = await import("../../db/repositories/subscription-cancellation");
+  service = await import("./subscription-cancellation");
+}, 120_000);
+afterAll(async () => {
+  await client.closeDatabaseConnectionsForTests();
+  mock.restore();
+});
+
+const session = async () => {};
+const stripeRefusal = () =>
+  Object.assign(new Error("Stripe refused the update"), {
+    type: "StripeAPIError",
+    statusCode: 500,
+  });
+async function seed() {
+  update.mockClear();
+  updateImpl = async () => {
+    throw new Error("No provider update is expected");
+  };
+  const f = await seedCancellationTestAccount();
+  customer = { id: f.source.stripe_customer_id, object: "customer", livemode: false };
+  subscription = f.provider;
+  return f;
+}
+function scheduled(f: Awaited<ReturnType<typeof seed>>) {
+  return {
+    ...f.provider,
+    cancel_at_period_end: true,
+    cancel_at: f.provider.current_period_end,
+    canceled_at: Math.floor(Date.now() / 1000),
+  };
+}
+async function row(id: string) {
+  const result = await client
+    .getPgliteClientForTests()
+    .query<{ status: string; error_code: string | null; cancellation_dispatch_state: string }>(
+      "SELECT status,error_code,cancellation_dispatch_state FROM billing_subscription_commands WHERE id=$1",
+      [id],
+    );
+  return result.rows[0];
+}
+/** Moves the settle window's start into the past instead of waiting for it. */
+async function age(id: string, column: "cancellation_dispatched_at" | "provider_started_at") {
+  const ms = repo.CANCELLATION_DISPATCH_SETTLE_MS + 1000;
+  await client
+    .getPgliteClientForTests()
+    .query(
+      `UPDATE billing_subscription_commands SET ${column}=${column}-make_interval(secs => $2::double precision / 1000) WHERE id=$1`,
+      [id, ms],
+    );
+}
+async function expireLease(id: string) {
+  await client
+    .getPgliteClientForTests()
+    .query(
+      "UPDATE billing_subscription_commands SET lease_expires_at=now()-interval '1 minute' WHERE id=$1",
+      [id],
+    );
+}
+
+test("a refused cancel stays uncertain inside the settle window and fails after it, so a new intent can cancel", async () => {
+  const f = await seed();
+  updateImpl = async () => {
+    throw stripeRefusal();
+  };
+  const first = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  expect(first.status).toBe("OUTCOME_UNKNOWN");
+  expect(update).toHaveBeenCalledTimes(1);
+
+  updateImpl = async () => {
+    throw new Error("A dispatched command must never be sent again");
+  };
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 0,
+    pending: 1,
+  });
+  expect(await row(first.commandId)).toMatchObject({ status: "OUTCOME_UNKNOWN" });
+  await expect(
+    service.submitOrganizationSubscriptionCancellation(
+      { ...f.input, idempotencyKey: randomUUID() },
+      session,
+    ),
+  ).rejects.toMatchObject({ context: { reason: "contradictory_command_pending" } });
+
+  await age(first.commandId, "cancellation_dispatched_at");
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 1,
+    pending: 0,
+  });
+  expect(await row(first.commandId)).toMatchObject({
+    status: "FAILED",
+    error_code: "PROVIDER_EFFECT_ABSENT_AFTER_SETTLE",
+  });
+  expect(update).toHaveBeenCalledTimes(1);
+
+  const replay = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  expect(replay).toMatchObject({ commandId: first.commandId, status: "FAILED" });
+
+  updateImpl = async () => {
+    subscription = scheduled(f);
+    return subscription;
+  };
+  const retry = await service.submitOrganizationSubscriptionCancellation(
+    { ...f.input, idempotencyKey: randomUUID() },
+    session,
+  );
+  expect(retry.status).toBe("APPLIED");
+  expect(retry.commandId).not.toBe(first.commandId);
+  expect(update).toHaveBeenCalledTimes(2);
+}, 120_000);
+
+test("a worker lost between the dispatch fence and the request settles to FAILED without a resend", async () => {
+  const f = await seed();
+  const prepared = await repo.prepareCancellation(f.input);
+  const claim = await repo.claimCancellation({ ...f.input, commandId: prepared.id });
+  if (!claim) throw new Error("Missing fixture claim");
+  await repo.assertCancellationClaimCurrent(f.input, claim, true);
+  await expireLease(prepared.id);
+
+  const sameKey = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  expect(sameKey.status).toBe("OUTCOME_UNKNOWN");
+
+  await age(prepared.id, "cancellation_dispatched_at");
+  const settled = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  expect(settled.status).toBe("FAILED");
+  expect(await row(prepared.id)).toMatchObject({
+    status: "FAILED",
+    error_code: "PROVIDER_EFFECT_ABSENT_AFTER_SETTLE",
+    cancellation_dispatch_state: "started",
+  });
+  expect(update).not.toHaveBeenCalled();
+}, 120_000);
+
+test("a claim that never crossed the dispatch fence fails once its window passes", async () => {
+  const f = await seed();
+  const prepared = await repo.prepareCancellation(f.input);
+  await repo.claimCancellation({ ...f.input, commandId: prepared.id });
+  await expireLease(prepared.id);
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 0,
+  });
+  expect(await row(prepared.id)).toMatchObject({ status: "OUTCOME_UNKNOWN" });
+
+  await age(prepared.id, "provider_started_at");
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 1,
+  });
+  expect(await row(prepared.id)).toMatchObject({
+    status: "FAILED",
+    error_code: "NOT_DISPATCHED_BEFORE_SETTLE",
+    cancellation_dispatch_state: "ready",
+  });
+  expect(update).not.toHaveBeenCalled();
+}, 120_000);
+
+test("an effect the provider shows after the window is still applied, not failed", async () => {
+  const f = await seed();
+  updateImpl = async () => {
+    throw stripeRefusal();
+  };
+  const first = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  expect(first.status).toBe("OUTCOME_UNKNOWN");
+  await age(first.commandId, "cancellation_dispatched_at");
+  subscription = scheduled(f);
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    applied: 1,
+    failed: 0,
+  });
+  expect(await row(first.commandId)).toMatchObject({ status: "APPLIED" });
+}, 120_000);

@@ -8,6 +8,7 @@ import {
   type CancellationIdentity,
   claimCancellation,
   failReviewedCancellationBeforeDispatch,
+  failUnsettledCancellation,
   finalizeCancellation,
   listCancellationRecovery,
   type PrepareCancellationInput,
@@ -177,7 +178,10 @@ async function executeClaim(
         );
       raw = await stripe.subscriptions.retrieve(claim.source.stripe_subscription_id);
     } else if (initial.scheduled !== targetScheduled) {
-      await releaseCancellation(input, claim);
+      // The provider shows no effect and this attempt may not send one. Once the
+      // settle window has passed nothing can still apply it, so it fails;
+      // otherwise the command stays uncertain for a later observation.
+      if (!(await failUnsettledCancellation(input, claim))) await releaseCancellation(input, claim);
       return toDto(await readCancellation({ ...input, commandId: claim.command.id }, kind));
     }
     await verifyCustomer();
