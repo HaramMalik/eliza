@@ -12,7 +12,10 @@ import {
 } from "../../lib/services/subscription-renewal-review-contract";
 import type { DbTransaction } from "../client";
 import { dbWrite, writeTransaction } from "../helpers";
-import { organizationSubscriptionAuthorities } from "../schemas/billing-subscriptions";
+import {
+  billingSubscriptions,
+  organizationSubscriptionAuthorities,
+} from "../schemas/billing-subscriptions";
 import { organizationEntitlements } from "../schemas/organization-entitlements";
 import { organizations } from "../schemas/organizations";
 import {
@@ -120,6 +123,72 @@ async function supersedeStalePreparedCancellation(
         eq(billingSubscriptionCommands.status, "PREPARED"),
       ),
     );
+}
+/**
+ * An uncertain command whose subscription moved on can never be claimed again.
+ * Once its settle window has passed nothing can still apply the request, so it
+ * is resolved against the subscription as it stands: FAILED ("not in effect
+ * now") when the target schedule is absent. It stays uncertain inside the
+ * window, for a configured schedule whose effect the row cannot show, and when
+ * the target is in effect: an unattributed effect is never recorded as this
+ * command's result. Runs under the actor lock with the command row locked.
+ */
+async function settleStrandedCancellation(
+  tx: DbTransaction,
+  organizationId: string,
+  command: BillingSubscriptionCommand,
+  now: Date,
+) {
+  const windowStart =
+    command.cancellation_dispatch_state === "started"
+      ? command.cancellation_dispatched_at
+      : command.provider_started_at;
+  if (
+    command.subscription_id === null ||
+    windowStart === null ||
+    windowStart.getTime() + CANCELLATION_DISPATCH_SETTLE_MS > now.getTime()
+  )
+    return false;
+  const [subscription] = await tx
+    .select({
+      cancelAtPeriodEnd: billingSubscriptions.cancel_at_period_end,
+      pendingPlanKey: billingSubscriptions.pending_plan_key,
+    })
+    .from(billingSubscriptions)
+    .where(
+      and(
+        isNull(billingSubscriptions.billing_scope_id),
+        eq(billingSubscriptions.organization_id, organizationId),
+        eq(billingSubscriptions.id, command.subscription_id),
+      ),
+    )
+    .for("update");
+  if (!subscription || subscription.pendingPlanKey !== null) return false;
+  if (subscription.cancelAtPeriodEnd === (command.kind === "cancel")) return false;
+  const [settled] = await tx
+    .update(billingSubscriptionCommands)
+    .set({
+      status: "FAILED",
+      error_code: "SUBSCRIPTION_CHANGED_EFFECT_ABSENT_AFTER_SETTLE",
+      state_revision: sql`${billingSubscriptionCommands.state_revision} + 1`,
+      lease_token: null,
+      lease_expires_at: null,
+      completed_at: now,
+      updated_at: now,
+    })
+    .where(
+      and(
+        isNull(billingSubscriptionCommands.billing_scope_id),
+        isNull(billingSubscriptionCommands.app_id),
+        eq(billingSubscriptionCommands.organization_id, organizationId),
+        eq(billingSubscriptionCommands.id, command.id),
+        eq(billingSubscriptionCommands.status, "OUTCOME_UNKNOWN"),
+        eq(billingSubscriptionCommands.execution_generation, command.execution_generation),
+        sql`(${billingSubscriptionCommands.lease_expires_at} IS NULL OR ${billingSubscriptionCommands.lease_expires_at} <= ${now})`,
+      ),
+    )
+    .returning({ id: billingSubscriptionCommands.id });
+  return Boolean(settled);
 }
 /**
  * Live organization commands split into those that block a new schedule
@@ -373,10 +442,14 @@ export async function claimCancellation(
       );
       await validatePredecessor(tx, source, command);
     } catch (error) {
-      if (command.status !== "PREPARED" || !isStaleSourceRejection(error)) throw error;
-      // Nothing was sent to the provider; settle it so the organization can retry.
-      await supersedeStalePreparedCancellation(tx, input.organizationId, command.id, now);
-      return null;
+      if (!isStaleSourceRejection(error)) throw error;
+      if (command.status === "PREPARED") {
+        // Nothing was sent to the provider; settle it so the organization can retry.
+        await supersedeStalePreparedCancellation(tx, input.organizationId, command.id, now);
+        return null;
+      }
+      if (await settleStrandedCancellation(tx, input.organizationId, command, now)) return null;
+      throw error;
     }
     const [projection] = await tx
       .select()

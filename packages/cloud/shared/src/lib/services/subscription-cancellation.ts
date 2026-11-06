@@ -241,12 +241,12 @@ export async function recoverOrganizationSubscriptionCancellations(limit: number
         command.kind === "resume" ? "resume" : "cancel",
       );
       if (!claim) {
-        // A stale PREPARED command is superseded instead of claimed.
+        // A stale command is superseded, or settled once its window passed, instead of claimed.
         const current = await readCancellation(
           { ...identity, commandId: command.id },
           command.kind === "resume" ? "resume" : "cancel",
         );
-        if (current.status === "SUPERSEDED") result.failed++;
+        if (current.status === "SUPERSEDED" || current.status === "FAILED") result.failed++;
         else result.pending++;
         continue;
       }

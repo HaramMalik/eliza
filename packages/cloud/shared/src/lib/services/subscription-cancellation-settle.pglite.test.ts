@@ -203,3 +203,112 @@ test("an effect the provider shows after the window is still applied, not failed
   });
   expect(await row(first.commandId)).toMatchObject({ status: "APPLIED" });
 }, 120_000);
+
+/** A provider observation that only moves the subscription's lifecycle revision forward, as a renewal does. */
+async function renew(organizationId: string, subscriptionId: string) {
+  const { subscriptionAuthorityRepository } = await import(
+    "../../db/repositories/subscription-authority"
+  );
+  const { subscriptionEntitlementsRepository } = await import(
+    "../../db/repositories/subscription-entitlements"
+  );
+  const current = await subscriptionAuthorityRepository.findById(organizationId, subscriptionId);
+  if (!current) throw new Error("Missing fixture subscription");
+  const {
+    id: _id,
+    organization_id: _organization,
+    lifecycle_revision: revision,
+    created_at: _created,
+    updated_at: _updated,
+    ...values
+  } = current;
+  const advanced = await subscriptionAuthorityRepository.advance({
+    organizationId,
+    subscriptionId,
+    expectedRevision: revision,
+    source: "webhook",
+    observation: "authoritative_provider_retrieval",
+    values: { ...values, provider_object_digest: randomUUID().replaceAll("-", "").repeat(2) },
+  });
+  const projection = await client
+    .getPgliteClientForTests()
+    .query<{ projection_revision: number }>(
+      "SELECT projection_revision FROM organization_entitlements WHERE organization_id=$1 AND billing_scope_id IS NULL",
+      [organizationId],
+    );
+  await subscriptionEntitlementsRepository.rebuild({
+    organizationId,
+    sourceSubscriptionId: subscriptionId,
+    sourceSubscriptionRevision: advanced.subscription.lifecycle_revision,
+    expectedProjectionRevision: Number(projection.rows[0]?.projection_revision ?? 0),
+  });
+  return advanced.subscription.lifecycle_revision;
+}
+
+test("a refused cancel whose subscription renewed meanwhile settles after the window, so a new intent can cancel", async () => {
+  const f = await seed();
+  updateImpl = async () => {
+    throw stripeRefusal();
+  };
+  const first = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  expect(first.status).toBe("OUTCOME_UNKNOWN");
+  const revision = await renew(f.input.organizationId, f.input.subscriptionId);
+  const next = { ...f.input, expectedSubscriptionRevision: revision };
+
+  updateImpl = async () => {
+    throw new Error("A dispatched command must never be sent again");
+  };
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 0,
+    unavailable: 1,
+  });
+  expect(await row(first.commandId)).toMatchObject({ status: "OUTCOME_UNKNOWN" });
+  await expect(
+    service.submitOrganizationSubscriptionCancellation(
+      { ...next, idempotencyKey: randomUUID() },
+      session,
+    ),
+  ).rejects.toMatchObject({ context: { reason: "contradictory_command_pending" } });
+
+  await age(first.commandId, "cancellation_dispatched_at");
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 1,
+    unavailable: 0,
+  });
+  expect(await row(first.commandId)).toMatchObject({
+    status: "FAILED",
+    error_code: "SUBSCRIPTION_CHANGED_EFFECT_ABSENT_AFTER_SETTLE",
+  });
+  expect(update).toHaveBeenCalledTimes(1);
+
+  updateImpl = async () => {
+    subscription = scheduled(f);
+    return subscription;
+  };
+  const retry = await service.submitOrganizationSubscriptionCancellation(
+    { ...next, idempotencyKey: randomUUID() },
+    session,
+  );
+  expect(retry.status).toBe("APPLIED");
+  expect(update).toHaveBeenCalledTimes(2);
+}, 120_000);
+
+test("an uncertain cancel whose renewed subscription already shows the target stays uncertain", async () => {
+  const f = await seed();
+  updateImpl = async () => {
+    throw stripeRefusal();
+  };
+  const first = await service.submitOrganizationSubscriptionCancellation(f.input, session);
+  await renew(f.input.organizationId, f.input.subscriptionId);
+  await client
+    .getPgliteClientForTests()
+    .query(
+      "UPDATE billing_subscriptions SET cancel_at_period_end=true, canceled_at=now() WHERE id=$1",
+      [f.input.subscriptionId],
+    );
+  await age(first.commandId, "cancellation_dispatched_at");
+  expect(await service.recoverOrganizationSubscriptionCancellations(5)).toMatchObject({
+    failed: 0,
+  });
+  expect(await row(first.commandId)).toMatchObject({ status: "OUTCOME_UNKNOWN" });
+}, 120_000);
