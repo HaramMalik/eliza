@@ -23,10 +23,16 @@ import { type DrainResult, retryDelayMs } from "../redis-queue";
 import { logger } from "../utils/logger";
 
 /**
- * List the webhook pushed to before the outbox. The cron moves anything left
- * there into the outbox; remove this lane once the lists are seen empty.
+ * Lists the pre-outbox queue used. The cron moves anything left there into the
+ * outbox, the dead-letter list included: the old route answered those events
+ * 200, so Stripe will not send them again, and in the outbox they get a fresh
+ * budget. Remove this lane once the lists are seen empty.
  */
-const LEGACY_STRIPE_QUEUE_KEYS = ["stripe-events", "stripe-events:processing"] as const;
+const LEGACY_STRIPE_QUEUE_KEYS = [
+  "stripe-events",
+  "stripe-events:processing",
+  "stripe-events:dlq",
+] as const;
 
 export interface StripeOutboxDrainOptions {
   /** Max deliveries to claim in one drain (default 25). */
@@ -149,7 +155,8 @@ async function sha256Hex(value: string): Promise<string> {
 /**
  * Moves deliveries left on the pre-outbox queue lists into the outbox. Each one
  * is written to its row before it is removed from the list, so a failure in
- * between only repeats the adoption, which changes nothing.
+ * between only repeats the adoption, which changes nothing. An entry whose
+ * adoption fails stays on its list for the next run.
  */
 async function adoptLegacyStripeQueue(): Promise<number> {
   let adopted = 0;
@@ -165,10 +172,20 @@ async function adoptLegacyStripeQueue(): Promise<number> {
         body = undefined;
       }
       if (body?.kind === "stripe.event") {
-        await webhookEventsRepository.adoptLegacyStripeDelivery(
-          body,
-          await sha256Hex(JSON.stringify(body.event)),
-        );
+        try {
+          await webhookEventsRepository.adoptLegacyStripeDelivery(
+            body,
+            await sha256Hex(JSON.stringify(body.event)),
+          );
+        } catch (error) {
+          // error-policy:J7 one bad entry must not stop the rest; it stays listed and is logged.
+          logger.error("[Stripe Outbox] Legacy queue entry not adopted; kept for the next run", {
+            key,
+            eventId: body.eventId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          continue;
+        }
         adopted++;
       } else logger.error("[Stripe Outbox] Dropping an unreadable legacy queue entry", { key });
       await cache.removeQueueValue(key, raw);
@@ -177,11 +194,23 @@ async function adoptLegacyStripeQueue(): Promise<number> {
   return adopted;
 }
 
-/** The cron lane: adopts what the pre-outbox queue still holds, then drains the outbox. */
+/**
+ * The cron lane: adopts what the pre-outbox queue still holds, then drains the
+ * outbox. The cutover never blocks the drain: a failure there is logged and
+ * the outbox is drained all the same.
+ */
 export async function drainStripeDeliveries(
   handler: StripeOutboxHandler,
   options: StripeOutboxDrainOptions = {},
 ): Promise<StripeOutboxDrainStats & { legacyAdopted: number }> {
-  const legacyAdopted = await adoptLegacyStripeQueue();
+  let legacyAdopted = 0;
+  try {
+    legacyAdopted = await adoptLegacyStripeQueue();
+  } catch (error) {
+    // error-policy:J7 the cutover is best effort; what it leaves stays on its list for the next run.
+    logger.error("[Stripe Outbox] Legacy queue adoption failed; draining the outbox anyway", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   return { ...(await drainStripeOutbox(handler, options)), legacyAdopted };
 }

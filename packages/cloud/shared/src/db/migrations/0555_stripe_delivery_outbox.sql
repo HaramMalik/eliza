@@ -10,5 +10,3 @@ ALTER TABLE "webhook_events"
  ADD COLUMN IF NOT EXISTS "delivery_dead_lettered_at" timestamp with time zone;
 --> statement-breakpoint
 ALTER TABLE "webhook_events" ADD CONSTRAINT "webhook_events_delivery_lease_check" CHECK (("delivery_lease_token" IS NULL) = ("delivery_lease_expires_at" IS NULL));
---> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "webhook_events_delivery_due_idx" ON "webhook_events" ("delivery_next_attempt_at") WHERE "delivery_payload" IS NOT NULL AND "delivery_completed_at" IS NULL AND "delivery_dead_lettered_at" IS NULL;

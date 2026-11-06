@@ -21,12 +21,14 @@ beforeAll(async () => {
     `CREATE TABLE webhook_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),event_id text NOT NULL UNIQUE,provider text NOT NULL,event_type text,payload_hash text NOT NULL,source_ip text,processed_at timestamp NOT NULL DEFAULT now(),event_timestamp timestamp,
       app_billing_trigger jsonb,app_billing_completed_at timestamptz,app_billing_next_attempt_at timestamptz NOT NULL DEFAULT now(),app_billing_error_code text)`,
   );
-  const migration = await readFile(
-    new URL("../../db/migrations/0555_stripe_delivery_outbox.sql", import.meta.url),
-    "utf8",
-  );
-  for (const statement of migration.split("--> statement-breakpoint"))
-    if (statement.trim()) await db.exec(statement);
+  for (const tag of ["0555_stripe_delivery_outbox", "0556_stripe_delivery_outbox_due_index"]) {
+    const migration = await readFile(
+      new URL(`../../db/migrations/${tag}.sql`, import.meta.url),
+      "utf8",
+    );
+    for (const statement of migration.split("--> statement-breakpoint"))
+      if (statement.trim()) await db.exec(statement);
+  }
   repo = (await import("../../db/repositories/webhook-events")).webhookEventsRepository;
   outbox = await import("./stripe-delivery-outbox");
   ({ cache } = await import("../cache/client"));
@@ -155,25 +157,68 @@ test("a delivery whose last attempt died is dead-lettered without running again"
   expect((await row(payload.eventId))?.delivery_dead_lettered_at).not.toBeNull();
 });
 
-test("retention never deletes undelivered work", async () => {
-  await settleAll();
-  const pending = await record();
-  const done = await record();
-  await drain();
-  const dueAgain = await record();
-  for (const eventId of [pending.eventId, done.eventId, dueAgain.eventId])
+for (const [name, cleanup] of [
+  ["cleanupOldEvents (the retention cron)", () => repo.cleanupOldEvents(30)],
+  ["cleanupOldEventsForProvider", () => repo.cleanupOldEventsForProvider("stripe", 30)],
+] as const)
+  test(`retention never deletes undelivered work: ${name}`, async () => {
+    await settleAll();
+    const done = await record();
+    const dead = await record();
+    await drain();
     await sql(
-      "UPDATE webhook_events SET processed_at=now()-interval '40 days' WHERE event_id=$1",
-      eventId,
+      "UPDATE webhook_events SET delivery_completed_at=NULL,delivery_dead_lettered_at=now() WHERE event_id=$1",
+      dead.eventId,
     );
-  await sql(
-    "UPDATE webhook_events SET delivery_completed_at=NULL,delivery_next_attempt_at=now()+interval '1 hour' WHERE event_id=$1",
-    pending.eventId,
+    const pending = await record();
+    const dueNow = await record();
+    const leased = await record();
+    await sql(
+      "UPDATE webhook_events SET delivery_next_attempt_at=now()+interval '1 hour' WHERE event_id=$1",
+      pending.eventId,
+    );
+    await sql(
+      "UPDATE webhook_events SET delivery_lease_token=gen_random_uuid(),delivery_lease_expires_at=now()+interval '1 hour' WHERE event_id=$1",
+      leased.eventId,
+    );
+    const all = [done, dead, pending, dueNow, leased];
+    for (const { eventId } of all)
+      await sql(
+        "UPDATE webhook_events SET processed_at=now()-interval '40 days' WHERE event_id=$1",
+        eventId,
+      );
+    await cleanup();
+    for (const { eventId } of [pending, dueNow, leased]) expect(await row(eventId)).toBeDefined();
+    for (const { eventId } of [done, dead]) expect(await row(eventId)).toBeUndefined();
+    await sql(
+      "UPDATE webhook_events SET delivery_lease_expires_at=now()-interval '1 second' WHERE event_id=$1",
+      leased.eventId,
+    );
+    await makeDue(pending.eventId);
+  });
+
+test("rows a drain claimed but did not reach inside its budget keep their attempts and are claimed at once", async () => {
+  await settleAll();
+  const first = await record();
+  const rest = [await record(), await record()];
+  const seen: string[] = [];
+  const stats = await outbox.drainStripeDeliveries(
+    async ({ body }) => {
+      seen.push(body.eventId);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return "ack";
+    },
+    { budgetMs: 200 },
   );
-  await repo.cleanupOldEventsForProvider("stripe", 30);
-  expect(await row(pending.eventId)).toBeDefined();
-  expect(await row(dueAgain.eventId)).toBeDefined();
-  expect(await row(done.eventId)).toBeUndefined();
+  expect(stats).toMatchObject({ claimed: 3, attempted: 1, released: 2 });
+  const reached = seen[0]!;
+  const unreached = [first, ...rest].map(({ eventId }) => eventId).filter((id) => id !== reached);
+  for (const eventId of unreached)
+    expect(await row(eventId)).toMatchObject({ delivery_attempts: 0, delivery_lease_token: null });
+  const reclaimed = await repo.claimDueStripeDeliveries(25, 60_000);
+  expect(reclaimed.map(({ eventId }) => eventId).sort()).toEqual(unreached.sort());
+  expect(reclaimed.map(({ attempts }) => attempts)).toEqual([1, 1]);
+  for (const delivery of reclaimed) await repo.completeStripeDelivery(delivery);
 });
 
 test("deliveries left on the pre-outbox queue are moved into the outbox and delivered once", async () => {
@@ -201,4 +246,30 @@ test("deliveries left on the pre-outbox queue are moved into the outbox and deli
   );
   expect(await cache.getQueueLength("stripe-events")).toBe(0);
   expect((await drain()).seen).toEqual([]);
+});
+
+test("a legacy entry that cannot be adopted stays listed and never blocks the outbox drain", async () => {
+  await settleAll();
+  const due = await record();
+  // Its event id is missing, so writing its row violates the schema.
+  const poison = JSON.stringify({
+    body: { ...message(), eventId: null },
+    attempts: 0,
+    enqueuedAt: Date.now(),
+  });
+  const deadLettered = message();
+  await cache.pushQueueHead("stripe-events", poison);
+  await cache.pushQueueHead(
+    "stripe-events:dlq",
+    JSON.stringify({ body: deadLettered, attempts: 8, enqueuedAt: Date.now() }),
+  );
+
+  const { seen, stats } = await drain();
+  expect(stats.legacyAdopted).toBe(1);
+  expect(seen.map(({ eventId }) => eventId).sort()).toEqual(
+    [due.eventId, deadLettered.eventId].sort(),
+  );
+  expect(await cache.listQueue("stripe-events")).toEqual([poison]);
+  expect(await cache.getQueueLength("stripe-events:dlq")).toBe(0);
+  await cache.removeQueueValue("stripe-events", poison);
 });
